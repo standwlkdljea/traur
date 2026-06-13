@@ -40,6 +40,15 @@ pub struct NpmScripts {
     pub postinstall: String,
 }
 
+/// A single AUR comment with its parsed date.
+#[derive(Debug, Clone)]
+pub struct CommentEntry {
+    /// Unix timestamp parsed from the comment date (e.g. "2025-08-04 15:08 (UTC)").
+    pub timestamp: i64,
+    /// Comment text with HTML tags stripped.
+    pub text: String,
+}
+
 /// All data a feature needs to run its analysis.
 pub struct PackageContext {
     pub name: String,
@@ -51,7 +60,7 @@ pub struct PackageContext {
     pub maintainer_packages: Vec<AurPackage>,
     pub github_stars: Option<u32>,
     pub github_not_found: bool,
-    pub aur_comments: Vec<String>,
+    pub aur_comments: Vec<CommentEntry>,
     /// Pre-computed maintainer reputation info (set by coordinator).
     pub maintainer_info: Option<MaintainerInfo>,
     /// True if orphan takeover pattern detected (B-ORPHAN-TAKEOVER signal emitted).

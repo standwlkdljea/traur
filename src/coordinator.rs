@@ -218,13 +218,34 @@ pub fn run_analysis_with_config(
             .retain(|s| !crate::shared::config::is_signal_ignored(config, &s.id, &s.category));
     }
 
-    let has_malware_warning = scoring::comment_contains_malware_warning(&ctx.aur_comments);
-
     let (votes, popularity) = ctx
         .metadata
         .as_ref()
         .map(|m| (m.num_votes, m.popularity))
         .unwrap_or((0, 0.0));
+
+    // Apply time-aware comment threat evaluation
+    let comment_verdict =
+        scoring::evaluate_comment_threat(&ctx.aur_comments, votes, popularity);
+    let has_malware_warning = match comment_verdict {
+        scoring::CommentSecurityVerdict::OverrideFire => true,
+        scoring::CommentSecurityVerdict::Degraded { points } => {
+            // Find M-COMMENTS-SECURITY signal and degrade it
+            for signal in &mut all_signals {
+                if signal.id == "M-COMMENTS-SECURITY" {
+                    signal.is_override_gate = false;
+                    signal.points = points;
+                }
+            }
+            false
+        }
+        scoring::CommentSecurityVerdict::Ignored => {
+            // Remove M-COMMENTS-SECURITY signal entirely
+            all_signals.retain(|s| s.id != "M-COMMENTS-SECURITY");
+            false
+        }
+        scoring::CommentSecurityVerdict::Clean => false,
+    };
 
     let score_input = scoring::ScoreInput {
         maintainer_info: ctx.maintainer_info.as_ref(),
@@ -401,6 +422,7 @@ mod tests {
 
     /// Real malicious commit: anythingllm-cli-bin attacker added
     /// a .install script running `npm install atomic-lockfile minimist`.
+    /// This test bypasses community comments to prove diff detection works.
     #[test]
     fn detects_malicious_diff_with_atomic_lockfile() {
         let ts = now_ts();
@@ -408,36 +430,33 @@ mod tests {
             name: "anythingllm-cli-bin".into(),
             package_base: None,
             url: Some("https://github.com/Mintplex-Labs/anything-llm-cli".into()),
-            num_votes: 5,
-            popularity: 0.5,
+            num_votes: 0,
+            popularity: 0.0,
             out_of_date: None,
-            maintainer: Some("attacker".into()),
-            submitter: Some("original".into()),
-            first_submitted: ts - 365 * 86400, // 1 year old
+            maintainer: Some("meryemplath".into()),  // attacker's email
+            submitter: Some("richc".into()),         // original submitter
+            first_submitted: ts - 365 * 86400,      // 1 year old — established
             last_modified: ts - 3600,
             license: None,
         };
 
-        let prior_pkgbuild = r#"pkgname=anythingllm-cli-bin
+        let prior_pkgbuild = r#"# Maintainer: Julian Corbet <julian.corbet@gmail.com>
+pkgname=anythingllm-cli-bin
+_pkgname=anything-llm-cli
 pkgver=0.0.13
 pkgrel=1
 arch=('x86_64' 'aarch64')
 depends=('glibc')
-source=("${pkgname}-${pkgver}.tar.gz")
-sha256sums=('abc123')
 "#;
 
-        // The attacker's diff: adds npm dependency and a .install script
-        // that runs `npm install atomic-lockfile minimist` in post_install
         let diff = r#"diff --git a/PKGBUILD b/PKGBUILD
 index af217ae..e9a0f65 100644
 --- a/PKGBUILD
 +++ b/PKGBUILD
 @@ -1,4 +1,4 @@
--# Maintainer: Original Author <original@gmail.com>
-+# Maintainer: Attacker <attacker@gmail.com>
+-# Maintainer: Julian Corbet <julian.corbet@gmail.com>
++# Maintainer: Julian Corbet <meryemplath@gmail.com>
  pkgname=anythingllm-cli-bin
- pkgver=0.0.13
 @@ -7 +7 @@ arch=('x86_64' 'aarch64')
 -depends=('glibc')
 +depends=('npm' 'glibc')
@@ -458,11 +477,11 @@ index 0000000..fff7451
 "#;
 
         let git_log = vec![
-            make_commit("attacker", Some(diff)),
-            make_commit("original", None),
+            make_commit("meryemplath", Some(diff)),
+            make_commit("richc", None),
         ];
 
-        let (_, _has_orphan, has_mal_diff) = compute_context_meta(
+        let (maint_info, has_orphan, has_mal_diff) = compute_context_meta(
             &metadata,
             &[],
             &git_log,
@@ -471,8 +490,41 @@ index 0000000..fff7451
 
         assert!(
             has_mal_diff,
-            "Expected has_new_malicious_diff=true: diff introduces atomic-lockfile (P-NPM-ATOMIC-LOCKFILE, 60pts) \
-             which was not in prior PKGBUILD"
+            "has_new_malicious_diff: diff introduces atomic-lockfile \
+             (P-NPM-ATOMIC-LOCKFILE 60pts) not in prior PKGBUILD"
+        );
+        assert!(
+            has_orphan,
+            "has_orphan_takeover: submitter changed (richc -> meryemplath) \
+             + new git author + established package"
+        );
+
+        // Prove the full pipeline: orphan + malicious diff = Malicious
+        // Simulate what run_analysis_with_config does, but skip comments gate
+        let signals: Vec<scoring::Signal> = Vec::new(); // no signals needed for this test
+        let (votes, popularity) = (metadata.num_votes, metadata.popularity);
+
+        let score_input = scoring::ScoreInput {
+            maintainer_info: maint_info.as_ref(),
+            votes,
+            popularity,
+            has_orphan_takeover: has_orphan,
+            has_new_malicious_diff: has_mal_diff,
+            npm_info: None,
+            has_community_malware_warning: false,  // deliberately bypass comments
+        };
+
+        let result = scoring::compute_score("anythingllm-cli-bin", &signals, &score_input);
+        // orphan + malicious diff -> risk = max(0, 95) = 95 -> trust = 5 -> Malicious
+        assert_eq!(
+            result.tier,
+            scoring::Tier::Malicious,
+            "orphan takeover + new malicious diff should be Malicious (trust {})",
+            result.score
+        );
+        assert!(
+            result.score <= 5,
+            "Expected trust <= 5, got {}", result.score
         );
     }
 

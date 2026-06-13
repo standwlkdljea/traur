@@ -1,4 +1,4 @@
-use crate::shared::models::{MaintainerInfo, NpmPackageInfo};
+use crate::shared::models::{CommentEntry, MaintainerInfo, NpmPackageInfo};
 use serde::Serialize;
 
 /// A signal emitted by a feature during analysis.
@@ -300,11 +300,163 @@ pub(crate) fn npm_suspicion_risk(info: &NpmPackageInfo) -> u32 {
     risk.min(30)
 }
 
-/// Check if any AUR comments contain security keywords.
-/// Used externally by coordinator to set `has_community_malware_warning`.
-pub fn comment_contains_malware_warning(comments: &[String]) -> bool {
+/// Result of evaluating AUR comment security threat with time-awareness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentSecurityVerdict {
+    /// No security threat detected in comments.
+    Clean,
+    /// Override gate should fire → Malicious (trust 0).
+    OverrideFire,
+    /// Threat exists but degraded by age or mitigation.
+    /// The M-COMMENTS-SECURITY signal should have is_override_gate=false
+    /// and its points reduced to this value.
+    Degraded { points: u32 },
+    /// Threat pattern is too old → remove M-COMMENTS-SECURITY signal entirely.
+    Ignored,
+}
+
+/// Phrases indicating a comment is mitigating or reassuring about a prior concern.
+/// ── Comment threat evaluation tunables ──
+/// Age thresholds for high/moderate popularity repos (< 3 votes, < 0.01 pop).
+const HIGH_POP_OVERRIDE_DAYS: i64 = 7;       // < this → OverrideFire
+const HIGH_POP_DEGRADE_DAYS: i64 = 60;        // < this → Degraded, >= this → Ignored
+const HIGH_POP_DEGRADED_POINTS: u32 = 20;
+
+/// Age thresholds for low popularity repos (votes < 3 && popularity < 0.01).
+const LOW_POP_DEGRADE_NEAR_DAYS: i64 = 30;    // < this → Degraded(20) with mitigation
+const LOW_POP_DEGRADE_MID_DAYS: i64 = 60;     // < this → Degraded(10) with mitigation
+const LOW_POP_ORPHAN_OVERRIDE_DAYS: i64 = 60; // >= this without mitigation → OverrideFire
+const LOW_POP_DEGRADED_NEAR_POINTS: u32 = 20;
+const LOW_POP_DEGRADED_FAR_POINTS: u32 = 10;
+const MITIGATION_FOLLOWUP_DELAY_SECS: i64 = 3 * 86400; // new comment after this → counts as follow-up
+
+/// Phrases indicating a comment is mitigating or reassuring about a prior concern.
+const MITIGATION_PHRASES: &[&str] = &[
+    "patched",
+    "fixed",
+    "resolved",
+    "not compromised",
+    "false alarm",
+    "false positive",
+    "different package",
+    "removed",
+    "addressed",
+    "taken down",
+];
+
+/// Evaluate AUR comment security threat with time-awareness.
+///
+/// Rules for **high/moderate popularity** repos (votes >= 3 || popularity >= 0.01):
+///   - Latest danger comment < 7 days old → OverrideFire
+///   - Latest danger comment 7 days – 2 months old → Degraded (20 pts)
+///   - Latest danger comment > 2 months old → Ignored
+///
+/// Rules for **low popularity** repos (votes < 3 && popularity < 0.01):
+///   IF mitigation/follow-up comments exist after the latest danger comment:
+///     - Latest danger < 1 month old → Degraded (20 pts)
+///     - Latest danger 1–2 months old → Degraded (10 pts)
+///     - Latest danger > 2 months old → Degraded (10 pts, never ignored)
+///   IF no mitigation/follow-up comments AND latest danger > 2 months:
+///     → OverrideFire (orphaned warning, always fires)
+///   Otherwise (no mitigation, < 2 months) → OverrideFire (default)
+pub fn evaluate_comment_threat(
+    comments: &[CommentEntry],
+    votes: u32,
+    popularity: f64,
+) -> CommentSecurityVerdict {
+    // Get current time
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let is_low_popularity = votes < 3 && popularity < 0.01;
+
+    // Find the newest comment that contains a security keyword
+    let mut latest_danger: Option<(i64, &str)> = None;
+    for entry in comments {
+        let lower = entry.text.to_lowercase();
+        if SECURITY_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+            // Check if this comment is actually mitigation (contains danger keyword
+            // but also mitigation phrases, e.g. "malware is from another package")
+            let is_mitigation = MITIGATION_PHRASES
+                .iter()
+                .any(|mp| lower.contains(mp));
+            if is_mitigation {
+                continue; // skip — this comment is reassuring, not warning
+            }
+            // Track the latest danger comment
+            if latest_danger.map_or(true, |(ts, _)| entry.timestamp > ts) {
+                latest_danger = Some((entry.timestamp, &entry.text));
+            }
+        }
+    }
+
+    let (danger_time, _danger_text) = match latest_danger {
+        Some(d) => d,
+        None => return CommentSecurityVerdict::Clean,
+    };
+
+    let age_seconds = (now - danger_time).max(0);
+    let age_days = age_seconds / 86400;
+
+    if is_low_popularity {
+        // Check for mitigation or follow-up comments after the danger comment
+        let has_mitigation = comments.iter().any(|entry| {
+            if entry.timestamp <= danger_time {
+                return false;
+            }
+            let lower = entry.text.to_lowercase();
+            // Mitigation comment: contains mitigation phrases
+            // OR: a non-danger comment posted > MITIGATION_FOLLOWUP_DELAY_SECS after danger
+            let is_mitigation_phrase = MITIGATION_PHRASES
+                .iter()
+                .any(|mp| lower.contains(mp));
+            if is_mitigation_phrase {
+                return true;
+            }
+            // Follow-up: any comment without security keywords after the delay
+            let seconds_after = entry.timestamp - danger_time;
+            let has_danger = SECURITY_KEYWORDS
+                .iter()
+                .any(|kw| lower.contains(kw));
+            !has_danger && seconds_after > MITIGATION_FOLLOWUP_DELAY_SECS
+        });
+
+        if has_mitigation {
+            if age_days < LOW_POP_DEGRADE_NEAR_DAYS {
+                CommentSecurityVerdict::Degraded { points: LOW_POP_DEGRADED_NEAR_POINTS }
+            } else if age_days < LOW_POP_DEGRADE_MID_DAYS {
+                CommentSecurityVerdict::Degraded { points: LOW_POP_DEGRADED_FAR_POINTS }
+            } else {
+                // > LOW_POP_DEGRADE_MID_DAYS, continue to lower but don't ignore
+                CommentSecurityVerdict::Degraded { points: LOW_POP_DEGRADED_FAR_POINTS }
+            }
+        } else if age_days > LOW_POP_ORPHAN_OVERRIDE_DAYS {
+            // No mitigation, older than threshold → always OverrideFire
+            CommentSecurityVerdict::OverrideFire
+        } else {
+            // No mitigation, under threshold → default OverrideFire
+            CommentSecurityVerdict::OverrideFire
+        }
+    } else {
+        // High/moderate popularity
+        if age_days < HIGH_POP_OVERRIDE_DAYS {
+            CommentSecurityVerdict::OverrideFire
+        } else if age_days < HIGH_POP_DEGRADE_DAYS {
+            CommentSecurityVerdict::Degraded { points: HIGH_POP_DEGRADED_POINTS }
+        } else {
+            CommentSecurityVerdict::Ignored
+        }
+    }
+}
+
+/// Check if any AUR comments contain security keywords (no time-awareness).
+/// Used by external code that needs a simple yes/no without time degradation.
+#[allow(dead_code)]
+pub fn comment_contains_malware_warning(comments: &[CommentEntry]) -> bool {
     comments.iter().any(|c| {
-        let lower = c.to_lowercase();
+        let lower = c.text.to_lowercase();
         SECURITY_KEYWORDS.iter().any(|kw| lower.contains(kw))
     })
 }
@@ -594,14 +746,209 @@ mod tests {
     #[test]
     fn comment_keyword_detection() {
         assert!(comment_contains_malware_warning(&[
-            "This package contains malware!".to_string()
+            CommentEntry { timestamp: 0, text: "This package contains malware!".into() }
         ]));
         assert!(comment_contains_malware_warning(&[
-            "Suspicious activity detected".to_string()
+            CommentEntry { timestamp: 0, text: "Suspicious activity detected".into() }
         ]));
         assert!(!comment_contains_malware_warning(&[
-            "Great package, works well!".to_string()
+            CommentEntry { timestamp: 0, text: "Great package, works well!".into() }
         ]));
         assert!(!comment_contains_malware_warning(&[]));
+    }
+
+    // ── evaluate_comment_threat tests ──
+
+    fn now_ts() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    fn entry_days_ago(days: i64, text: &str) -> CommentEntry {
+        CommentEntry {
+            timestamp: now_ts() - days * 86400,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn eval_no_danger_keywords_returns_clean() {
+        let comments = vec![
+            entry_days_ago(1, "Great package!"),
+            entry_days_ago(5, "Works perfectly"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 10, 1.0),
+            CommentSecurityVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn eval_high_pop_recent_danger_override() {
+        let comments = vec![
+            entry_days_ago(3, "This package contains malware!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 10, 1.0),
+            CommentSecurityVerdict::OverrideFire
+        );
+    }
+
+    #[test]
+    fn eval_high_pop_week_old_degraded() {
+        let comments = vec![
+            entry_days_ago(10, "This package contains malware!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 10, 1.0),
+            CommentSecurityVerdict::Degraded { points: 20 }
+        );
+    }
+
+    #[test]
+    fn eval_high_pop_old_ignored() {
+        let comments = vec![
+            entry_days_ago(90, "This package contains malware!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 10, 1.0),
+            CommentSecurityVerdict::Ignored
+        );
+    }
+
+    #[test]
+    fn eval_low_pop_recent_with_mitigation_degraded() {
+        // Mitigation comment posted after the danger comment
+        let comments = vec![
+            entry_days_ago(1, "Package has been patched, safe now"),  // mitigation (newer)
+            entry_days_ago(5, "This package contains malware!"),      // danger (older)
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 0, 0.0),
+            CommentSecurityVerdict::Degraded { points: 20 }
+        );
+    }
+
+    #[test]
+    fn eval_low_pop_old_no_mitigation_override() {
+        let comments = vec![
+            entry_days_ago(90, "This package contains malware!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 0, 0.0),
+            CommentSecurityVerdict::OverrideFire
+        );
+    }
+
+    #[test]
+    fn eval_mitigation_comment_not_counted_as_danger() {
+        // Comment contains "malware" but also "not compromised" → should be skipped
+        let comments = vec![
+            entry_days_ago(1, "Note that the malware is from another package. This one is not compromised."),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 10, 1.0),
+            CommentSecurityVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn eval_followup_comment_counts_as_mitigation() {
+        // Follow-up comment without danger keywords > 3 days after danger
+        let comments = vec![
+            entry_days_ago(1, "Thanks for the update!"),              // follow-up (newer)
+            entry_days_ago(10, "This package contains malware!"),     // danger (older)
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 0, 0.0),
+            CommentSecurityVerdict::Degraded { points: 20 }
+        );
+    }
+
+    #[test]
+    fn eval_low_pop_1_to_2_months_mitigation_further_degraded() {
+        let comments = vec![
+            entry_days_ago(1, "Fixed in latest version"),   // mitigation
+            entry_days_ago(45, "This package contains malware!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 0, 0.0),
+            CommentSecurityVerdict::Degraded { points: 10 }
+        );
+    }
+
+    #[test]
+    fn eval_low_pop_over_2_months_mitigation_still_degraded() {
+        let comments = vec![
+            entry_days_ago(1, "Resolved now"),              // mitigation
+            entry_days_ago(90, "This package contains malware!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 0, 0.0),
+            CommentSecurityVerdict::Degraded { points: 10 }
+        );
+    }
+
+    #[test]
+    fn eval_empty_comments_clean() {
+        assert_eq!(
+            evaluate_comment_threat(&[], 0, 0.0),
+            CommentSecurityVerdict::Clean
+        );
+    }
+
+    #[test]
+    fn eval_moderate_pop_treated_as_high() {
+        // votes=3 is the boundary — should be "high/moderate"
+        let comments = vec![
+            entry_days_ago(10, "This package contains malware!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 3, 0.0),
+            CommentSecurityVerdict::Degraded { points: 20 }
+        );
+    }
+
+    #[test]
+    fn eval_low_pop_recent_no_mitigation_override() {
+        // Low pop, 5 days ago, no mitigation → default OverrideFire
+        let comments = vec![
+            entry_days_ago(5, "This package contains a backdoor!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 0, 0.0),
+            CommentSecurityVerdict::OverrideFire
+        );
+    }
+
+    #[test]
+    fn eval_attacker_says_safe_after_malware_report() {
+        // Attacker posts "It's safe!" immediately after a user reports "Malware!"
+        // on a low-popularity repo. The word "safe" is in MITIGATION_PHRASES,
+        // so it is treated as mitigation and degrades the override gate.
+        let comments = vec![
+            entry_days_ago(1, "It's safe!"),                         // attacker (newer)
+            entry_days_ago(5, "This package contains malware!"),     // real user report (older)
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 0, 0.0),
+            CommentSecurityVerdict::Degraded { points: 20 }
+        );
+    }
+
+    #[test]
+    fn eval_high_pop_attacker_safe_ignored() {
+        // Same scenario on a high-pop repo: "safe" mitigation is NOT checked
+        // (only age-based rules apply), so < 7 days → OverrideFire.
+        let comments = vec![
+            entry_days_ago(1, "It's safe!"),
+            entry_days_ago(5, "This package contains malware!"),
+        ];
+        assert_eq!(
+            evaluate_comment_threat(&comments, 10, 1.0),
+            CommentSecurityVerdict::OverrideFire
+        );
     }
 }

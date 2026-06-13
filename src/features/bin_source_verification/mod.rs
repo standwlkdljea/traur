@@ -80,6 +80,8 @@ impl Feature for BinSourceVerification {
                                 "-bin package upstream is github.com/{u_org} but source downloads from github.com/{s_org}"
                             ),
                             is_override_gate: false,
+                            is_critical: false,
+
                             matched_line: Some(raw_url.clone()),
                         });
                     }
@@ -97,6 +99,8 @@ impl Feature for BinSourceVerification {
                         "-bin package upstream is {upstream_domain} but source downloads from {src_domain}"
                     ),
                     is_override_gate: false,
+                    is_critical: false,
+
                     matched_line: Some(raw_url.clone()),
                 });
             }
@@ -216,6 +220,10 @@ mod tests {
             github_stars: None,
             github_not_found: false,
             aur_comments: vec![],
+                    maintainer_info: None,
+            has_orphan_takeover: false,
+            has_new_malicious_diff: false,
+            npm_info: None,
         };
         BinSourceVerification.analyze(&ctx)
     }

@@ -2,7 +2,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static COMMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<div class="article-content"[^>]*>([\s\S]*?)</div>"#).unwrap()
+    Regex::new(r#"<div[^>]*\bclass="article-content"[^>]*>([\s\S]*?)</div>"#).unwrap()
 });
 
 static HTML_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {

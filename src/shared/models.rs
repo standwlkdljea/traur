@@ -1,5 +1,45 @@
 use serde::Deserialize;
 
+/// Maintainer reputation information for trust factor computation.
+#[derive(Debug, Clone)]
+pub struct MaintainerInfo {
+    /// Oldest package first_submitted timestamp as proxy for account age.
+    pub account_created_date: u64,
+    /// Number of packages maintained.
+    pub number_of_packages: u32,
+    /// Whether the current maintainer is the original submitter.
+    pub is_original_submitter: bool,
+    /// Days since maintainer change (orphan takeover or submitter changed).
+    pub days_since_takeover: Option<u32>,
+}
+
+/// Information about an NPM package referenced in PKGBUILD.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NpmPackageInfo {
+    pub scripts: NpmScripts,
+    #[serde(default)]
+    pub maintainer_account_age: u32,    // days
+    #[serde(default)]
+    pub maintainer_package_count: u32,
+    #[serde(default)]
+    pub github_repo_exists: bool,
+    #[serde(default)]
+    pub github_stars: u32,
+    #[serde(default)]
+    pub github_commit_freshness: u32,   // days since last commit
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct NpmScripts {
+    #[serde(default)]
+    pub preinstall: String,
+    #[serde(default)]
+    pub install: String,
+    #[serde(default)]
+    pub postinstall: String,
+}
+
 /// All data a feature needs to run its analysis.
 pub struct PackageContext {
     pub name: String,
@@ -12,6 +52,14 @@ pub struct PackageContext {
     pub github_stars: Option<u32>,
     pub github_not_found: bool,
     pub aur_comments: Vec<String>,
+    /// Pre-computed maintainer reputation info (set by coordinator).
+    pub maintainer_info: Option<MaintainerInfo>,
+    /// True if orphan takeover pattern detected (B-ORPHAN-TAKEOVER signal emitted).
+    pub has_orphan_takeover: bool,
+    /// True if new malicious diff detected (T-MALICIOUS-DIFF signal emitted).
+    pub has_new_malicious_diff: bool,
+    /// NPM package metadata (set if PKGBUILD uses npm/yarn and package identified).
+    pub npm_info: Option<NpmPackageInfo>,
 }
 
 /// Package metadata from AUR RPC API v5.

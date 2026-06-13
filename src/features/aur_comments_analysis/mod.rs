@@ -45,7 +45,8 @@ impl Feature for AurCommentsAnalysis {
                         description: format!(
                             "AUR comment mentions security concern (keyword: {keyword})"
                         ),
-                        is_override_gate: false,
+                        is_override_gate: true,
+                        is_critical: false,
                         matched_line: Some(truncated),
                     }];
                 }
@@ -76,6 +77,10 @@ mod tests {
             github_stars: None,
             github_not_found: false,
             aur_comments: comments.into_iter().map(|s| s.to_string()).collect(),
+            maintainer_info: None,
+            has_orphan_takeover: false,
+            has_new_malicious_diff: false,
+            npm_info: None,
         };
         AurCommentsAnalysis
             .analyze(&ctx)

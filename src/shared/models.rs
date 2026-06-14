@@ -14,19 +14,48 @@ pub struct MaintainerInfo {
 }
 
 /// Information about an NPM package referenced in PKGBUILD.
+///
+/// All fields relevant to the NPM Suspicion Score (Snpm) computation.
+/// See `scoring.rs` → `npm_suspicion_risk()` for the scoring formula.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NpmPackageInfo {
-    pub scripts: NpmScripts,
+    /// The npm package name extracted from the PKGBUILD (e.g. "electron-builder").
+    /// Empty if the package name could not be determined.
     #[serde(default)]
-    pub maintainer_account_age: u32,    // days
+    pub package_name: String,
+
+    /// Lifecycle scripts extracted from package.json (preinstall/install/postinstall).
+    pub scripts: NpmScripts,
+
+    // --- npm registry fields ---
+    /// Age of the npm publisher account in days.
+    /// Used by f_auth (burner account risk).
+    #[serde(default)]
+    pub maintainer_account_age: u32,
+    /// Number of packages published by this maintainer on npm.
+    /// Used as a proxy for takeover anomaly (C: whether maintainer is likely new).
     #[serde(default)]
     pub maintainer_package_count: u32,
+
+    // --- GitHub repository fields ---
+    /// Whether the npm package links to a valid GitHub repo.
     #[serde(default)]
     pub github_repo_exists: bool,
+    /// Stars on the GitHub repo. Used by f_bot (botting risk).
     #[serde(default)]
     pub github_stars: u32,
+    /// Days since last commit pushed. Used by f_time (takeover anomaly) as Δt.
     #[serde(default)]
-    pub github_commit_freshness: u32,   // days since last commit
+    pub github_commit_freshness: u32,
+    /// Forks count from GitHub. Used by f_bot (interaction signal).
+    #[serde(default)]
+    pub github_forks: u32,
+    /// Closed issues count from GitHub search. Used by f_bot (interaction signal).
+    #[serde(default)]
+    pub github_closed_issues: u32,
+    /// README size in bytes from GitHub. Used by f_doc (documentation risk).
+    #[serde(default)]
+    pub github_readme_bytes: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

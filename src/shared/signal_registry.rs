@@ -73,7 +73,8 @@ fn hardcoded_signals() -> Vec<SignalDef> {
         ("B-ORPHAN-TAKEOVER", Behavioral, 50, "Adopted package with new git author (orphan takeover pattern)", false, false),
         // bin_source_verification
         ("B-BIN-GITHUB-ORG-MISMATCH", Behavioral, 50, "-bin package source downloads from different GitHub org than upstream", false, false),
-        ("B-BIN-DOMAIN-MISMATCH", Behavioral, 30, "-bin package source downloads from different domain than upstream", false, false),
+        ("B-BIN-DOMAIN-MISMATCH", Behavioral, 50, "-bin package source downloads from different domain than upstream", false, false),
+        ("B-BIN-SUBDOMAIN-MISMATCH", Behavioral, 10, "-bin package source downloads from CDN subdomain of upstream", false, false),
         // git_history_analysis
         ("T-SINGLE-COMMIT", Temporal, 20, "Git history has only 1 commit", false, false),
         ("T-NEW-PACKAGE", Temporal, 25, "Package is very new (< 7 days old)", false, false),
@@ -104,6 +105,10 @@ fn hardcoded_signals() -> Vec<SignalDef> {
         ("SA-DATA-BLOB-BASE64", Pkgbuild, 50, "Embedded long base64 string (possible encoded payload)", false, false),
         ("SA-HIGH-ENTROPY-HEREDOC", Pkgbuild, 55, "Heredoc with high entropy content", false, false),
         ("SA-BINARY-DOWNLOAD-NOCOMPILE", Pkgbuild, 60, "Downloads file and chmod +x with no compilation step", false, false),
+        // install_script_analysis (hardcoded)
+        ("P-INSTALL-SUID", Pkgbuild, 55, "Setting SUID/SGID bit in install script (privilege escalation)", false, false),
+        // NPM legitimacy check
+        ("N-NPM-LEGITIMACY-CHECKED", Pkgbuild, 0, "NPM package legitimacy verified by deep analysis", false, false),
     ];
 
     defs.into_iter()

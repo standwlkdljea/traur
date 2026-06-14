@@ -81,18 +81,6 @@ const SECURITY_KEYWORDS: &[&str] = &[
     "exploit",
 ];
 
-/// NPM install script commands that are considered suspicious.
-const NPM_SUSPICIOUS_COMMANDS: &[&str] = &[
-    "eval",
-    "exec",
-    "child_process",
-    "curl",
-    "wget",
-    "base64",
-    "bash",
-    "sh ",
-];
-
 /// Compute the final score and tier using the context-aware scoring pipeline.
 ///
 /// Pipeline order:
@@ -252,52 +240,131 @@ fn maintainer_trust_factor(info: &MaintainerInfo) -> f64 {
     0.3 * age_trust + 0.2 * count_trust + 0.5 * takeover_penalty
 }
 
-/// Compute additional NPM suspicion risk (0-30 points).
-pub(crate) fn npm_suspicion_risk(info: &NpmPackageInfo) -> u32 {
-    let mut risk: u32 = 0;
+/// Maximum NPM suspicion risk in points.
+const R_MAX: u32 = 30;
 
-    // Inspect install scripts for suspicious commands
+/// Botting risk: κ controls the stars-to-interaction ratio curve.
+const KAPPA: f64 = 5.0;
+
+/// Documentation risk: λ controls how quickly README size reduces risk.
+const LAMBDA: f64 = 0.01;
+
+/// Takeover anomaly: τ = dormancy threshold (months), k = sigmoid steepness.
+const TAU: f64 = 12.0;
+const K_FACTOR: f64 = 1.0;
+
+/// Burner account risk: γ = 0.023 gives a 30-day half-life.
+const GAMMA: f64 = 0.023;
+
+/// NPM install script commands considered a critical payload signature.
+/// The presence of any of these triggers Ω = Rmax in the Snpm formula.
+const NPM_CRITICAL_COMMANDS: &[&str] = &[
+    "eval",
+    "exec",
+    "child_process",
+    "curl",
+    "wget",
+    "base64",
+    "bash",
+    "sh ",
+];
+
+// ─────────────────────────────────────────────────────────────
+// NPM Suspicion Score (Snpm) — four-component weighted model
+// ─────────────────────────────────────────────────────────────
+//
+//   Snpm = min( Rmax,  Σ Wi·fi(x)  +  Ω )
+//
+// where Ω = Rmax if a critical payload signature is detected in
+// lifecycle scripts, and 0 otherwise.
+//
+// ──── Components ────────────────────────────────────────────
+//
+// 1. f_bot (Botting Risk)     W=15   κ=5.0
+//    f_bot(S, A) = S / [S + κ·(A+1)²]
+//    S = stars, A = forks + closed_issues
+//    → punishes inflated stars with no human interaction.
+//    Ex: 50★/5 forks → 0.21;  500★/0 forks → 0.99;  5000★/500 → 0.004
+//
+// 2. f_doc (Documentation Risk)  W=5   λ=0.01
+//    f_doc(L) = e^(-λ·L)
+//    L = README bytes
+//    → empty README is a red flag; 200+ bytes is safe.
+//    Ex: L=0→1.0;  L=50→0.60;  L=200→0.13
+//
+// 3. f_time (Takeover Anomaly)   W=15   k=1.0   τ=12.0
+//    f_time(Δt, C) = C · 1/[1 + e^(-k(Δt - τ))]
+//    Δt = months since last commit, C ∈ {0,1} (burner proxy)
+//    → dormant package suddenly revived by burner account.
+//    Ex: Δt=3→0.0001;  Δt=12→0.50;  Δt=18→0.997
+//
+// 4. f_auth (Burner Account)   W=10   γ=0.023 (30-day half-life)
+//    f_auth(D) = e^(-γ·D)
+//    D = npm account age in days
+//    → new accounts are far riskier.
+//    Ex: D=1→0.97;  D=30→0.50;  D=90→0.12
+
+/// Compute the NPM Suspicion Score for a package's npm dependency metadata.
+///
+/// Returns 0-30 points added to the PKGBUILD risk score.
+/// A high score (≥25) indicates the npm dependency itself is suspicious
+/// and can trigger the critical gate in the scoring pipeline.
+///
+/// See the module documentation above for the full mathematical formula.
+pub(crate) fn npm_suspicion_risk(info: &NpmPackageInfo) -> u32 {
+    // ── Omega: critical payload override ──
     let all_scripts = format!(
         "{} {} {}",
         info.scripts.preinstall, info.scripts.install, info.scripts.postinstall
     );
     let lower = all_scripts.to_lowercase();
-
-    let has_suspicious = NPM_SUSPICIOUS_COMMANDS
+    let has_critical_payload = NPM_CRITICAL_COMMANDS
         .iter()
         .any(|cmd| lower.contains(cmd));
 
-    if has_suspicious {
-        risk += 25;
-    } else if !all_scripts.trim().is_empty()
-        && !all_scripts.contains("node-gyp rebuild")
-        && !all_scripts.contains("node-pre-gyp install")
-        && !all_scripts.contains("tsc")
-    {
-        risk += 15; // unexpected script
-    }
-
-    // NPM maintainer reputation
-    if info.maintainer_account_age < 90 {
-        risk += 10;
-    }
-    if info.maintainer_package_count == 1 {
-        risk += 5;
-    }
-
-    // GitHub repo signals
-    if !info.github_repo_exists {
-        risk += 10;
+    let omega: f64 = if has_critical_payload {
+        R_MAX as f64
     } else {
-        if info.github_stars == 0 {
-            risk += 5;
-        }
-        if info.github_commit_freshness > 180 {
-            risk += 5;
-        }
-    }
+        0.0
+    };
 
-    risk.min(30)
+    // ── f_bot: botting risk ──
+    let s = info.github_stars as f64;
+    let a = (info.github_forks + info.github_closed_issues) as f64;
+    let f_bot = if info.github_repo_exists {
+        s / (s + KAPPA * (a + 1.0).powi(2))
+    } else {
+        // No repo → maximum botting risk
+        1.0
+    };
+
+    // ── f_doc: documentation risk ──
+    let f_doc = {
+        let l = info.github_readme_bytes as f64;
+        (-LAMBDA * l).exp()
+    };
+
+    // ── f_time: takeover anomaly ──
+    let f_time = {
+        // C: burner proxy — an npm maintainer with only 1 published package
+        // is treated as a likely burner account taking over a dormant package.
+        let c = if info.maintainer_package_count <= 1 { 1.0 } else { 0.0 };
+        let delta_t = info.github_commit_freshness as f64 / 30.0; // days → months
+        let exponent = -K_FACTOR * (delta_t - TAU);
+        c / (1.0 + exponent.exp())
+    };
+
+    // ── f_auth: burner account risk ──
+    let f_auth = {
+        let d = info.maintainer_account_age as f64;
+        (-GAMMA * d).exp()
+    };
+
+    // ── Weighted sum + Omega, clamped to [0, Rmax] ──
+    let sum = 15.0 * f_bot + 5.0 * f_doc + 15.0 * f_time + 10.0 * f_auth + omega;
+    let risk = sum.clamp(0.0, R_MAX as f64);
+
+    risk.round() as u32
 }
 
 /// Result of evaluating AUR comment security threat with time-awareness.
@@ -708,6 +775,7 @@ mod tests {
     #[test]
     fn npm_suspicion_detects_suspicious_scripts() {
         let info = NpmPackageInfo {
+            package_name: "evil-pkg".to_string(),
             scripts: crate::shared::models::NpmScripts {
                 preinstall: String::new(),
                 install: String::new(),
@@ -719,15 +787,19 @@ mod tests {
             github_repo_exists: false,
             github_stars: 0,
             github_commit_freshness: 365,
+            github_forks: 0,
+            github_closed_issues: 0,
+            github_readme_bytes: 0,
         };
         let risk = npm_suspicion_risk(&info);
-        // 25 (suspicious cmd) + 10 (account < 90d) + 5 (single pkg) + 10 (no repo) = 50, capped at 30
+        // Omega=30 (critical payload) → Snpm = min(30, Σ W·f + 30) = 30
         assert_eq!(risk, 30);
     }
 
     #[test]
-    fn npm_suspicion_clean_package_zero() {
+    fn npm_suspicion_clean_package_low_risk() {
         let info = NpmPackageInfo {
+            package_name: "safe-pkg".to_string(),
             scripts: crate::shared::models::NpmScripts {
                 preinstall: String::new(),
                 install: "node-gyp rebuild".to_string(),
@@ -738,8 +810,13 @@ mod tests {
             github_repo_exists: true,
             github_stars: 100,
             github_commit_freshness: 10,
+            github_forks: 20,
+            github_closed_issues: 50,
+            github_readme_bytes: 2000,
         };
         let risk = npm_suspicion_risk(&info);
+        // Ω=0 (node-gyp is not a critical payload), f_bot≈0.004, f_doc≈0, f_time=0, f_auth≈0.0002
+        // sum = 15*0.004 + 5*0 + 15*0 + 10*0.0002 ≈ 0.06 → risk 0
         assert_eq!(risk, 0);
     }
 

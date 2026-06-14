@@ -224,6 +224,78 @@ pub fn run_analysis_with_config(
         .map(|m| (m.num_votes, m.popularity))
         .unwrap_or((0, 0.0));
 
+    // ── NPM dynamic penalty: if PKGBUILD uses npm install/npx, check legitimacy ──
+    let has_npm_suspicious = all_signals.iter().any(|s| s.id == "P-NPM-SUSPICIOUS-SCRIPT");
+    if has_npm_suspicious {
+        if let Some(ref npm) = ctx.npm_info {
+            let npm_risk = scoring::npm_suspicion_risk(npm);
+
+            if npm_risk >= 25 {
+                // Malicious npm deps: escalate to critical gate (Step 2 -> Malicious)
+                for signal in &mut all_signals {
+                    if signal.id == "P-NPM-SUSPICIOUS-SCRIPT" {
+                        signal.is_critical = true;
+                        signal.points = 90;
+                        signal.description = format!(
+                            "NPM package {} has suspicious install scripts (npm risk {}) – possible payload vector",
+                            npm.package_name,
+                            npm_risk
+                        );
+                    }
+                }
+            } else {
+                // Legitimate npm deps: downgrade to minor warning
+                for signal in &mut all_signals {
+                    if signal.id == "P-NPM-SUSPICIOUS-SCRIPT" {
+                        signal.points = 10;
+                        signal.description = format!(
+                            "Running npm lifecycle scripts for {} – legitimate deps verified, but still bad practice (offline-build violation)",
+                            npm.package_name
+                        );
+                    }
+                }
+            }
+
+            // Emit N-NPM-LEGITIMACY-CHECKED signal to show the fork did its job
+            let npm_desc = if npm_risk >= 25 {
+                format!("NPM legitimacy check: SUSPICIOUS (npm suspicion risk {})", npm_risk)
+            } else {
+                format!("NPM legitimacy check: legitimate (npm suspicion risk {})", npm_risk)
+            };
+            all_signals.push(scoring::Signal {
+                id: "N-NPM-LEGITIMACY-CHECKED".to_string(),
+                category: scoring::SignalCategory::Pkgbuild,
+                points: 0,
+                description: npm_desc,
+                is_override_gate: false,
+                is_critical: false,
+                matched_line: None,
+            });
+        }
+        // else: no npm_info fetched (network issue or unrecognized package),
+        // keep P-NPM-SUSPICIOUS-SCRIPT as-is (static analysis penalty)
+
+        // ── B-SUBMITTER-CHANGED amplification: only severe if npm install was added by new maintainer ──
+        let has_submitter_changed = all_signals.iter().any(|s| s.id == "B-SUBMITTER-CHANGED");
+        if has_submitter_changed {
+            // Check if npm/yarn/npx was already in the prior PKGBUILD
+            let npm_was_always_there = ctx.prior_pkgbuild_content.as_deref().is_some_and(|prior| {
+                let re = regex::Regex::new(r"(?i)(npm\s+(install|run)|npx\s+|yarn\s+(install|add))").unwrap();
+                re.is_match(prior)
+            });
+
+            if npm_was_always_there {
+                // npm install was always there, not added by new maintainer → reduce severity
+                for signal in &mut all_signals {
+                    if signal.id == "B-SUBMITTER-CHANGED" {
+                        signal.points = 5;
+                        signal.description = "Package maintainer differs from original submitter (npm install pre-dates maintainer change)".to_string();
+                    }
+                }
+            }
+        }
+    }
+
     // Apply time-aware comment threat evaluation
     let comment_verdict =
         scoring::evaluate_comment_threat(&ctx.aur_comments, votes, popularity);

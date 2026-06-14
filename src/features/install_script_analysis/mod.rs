@@ -256,6 +256,36 @@ mod tests {
     }
 
     #[test]
+    fn install_suid_bit() {
+        let ids = analyze("chmod 4755 /opt/obsidian/chrome-sandbox");
+        assert!(has(&ids, "P-INSTALL-SUID"), "chmod 4755 in install script should be detected");
+    }
+
+    #[test]
+    fn install_suid_bit_symbolic() {
+        let ids = analyze("chmod +s /usr/bin/evil");
+        assert!(has(&ids, "P-INSTALL-SUID"), "chmod +s in install script should be detected");
+    }
+
+    #[test]
+    fn install_suid_bit_sgid() {
+        let ids = analyze("chmod 2755 /usr/bin/tool");
+        assert!(has(&ids, "P-INSTALL-SUID"), "chmod 2755 (SGID) in install script should be detected");
+    }
+
+    #[test]
+    fn install_suid_bit_intervening_flags() {
+        let ids = analyze("chmod -v 4755 /opt/tool/chrome-sandbox");
+        assert!(has(&ids, "P-INSTALL-SUID"), "chmod -v 4755 in install script should be detected");
+    }
+
+    #[test]
+    fn install_no_suid_for_regular_chmod() {
+        let ids = analyze("chmod 755 /usr/bin/tool");
+        assert!(!has(&ids, "P-INSTALL-SUID"), "chmod 755 should not trigger SUID in install script");
+    }
+
+    #[test]
     fn benign_install_no_signals() {
         let ids = analyze(r#"
 post_install() {

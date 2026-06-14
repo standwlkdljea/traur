@@ -26,13 +26,13 @@ static NPM_PKG_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"registry\.npmjs\.org/(@?[\w.-]+(?:/[@\w][\w.-]*)?)"#).unwrap()
 });
 
-/// Match npm/yarn/npx commands with a specific package.
+/// Match npm/yarn/bun install/add commands with a specific package.
 ///
 /// Uses `[ \t]+` (NOT `\s+`) to prevent matching across newlines — `\s`
 /// matches `\n` in Rust's regex crate, which would greedily consume line
 /// breaks and capture words from the next line as a false package name.
 static NPM_INSTALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(npm|yarn)\s+(install|add)[ \t]+(-g[ \t]+)?['"]?(@?[\w@./-]+)"#).unwrap()
+    Regex::new(r#"(npm|yarn|bun)\s+(install|add)[ \t]+(-g[ \t]+)?['"]?(@?[\w@./-]+)"#).unwrap()
 });
 
 /// Match `npx <package>` commands and extract the package name.
@@ -130,6 +130,7 @@ pub fn fetch_npm_info(pkgbuild_content: &str) -> Option<NpmPackageInfo> {
         github_forks: 0,
         github_closed_issues: 0,
         github_readme_bytes: 0,
+        repo_spoofed: false,
     };
 
     // If npm package has a GitHub repo, fetch deep-inspection stats
@@ -152,6 +153,21 @@ pub fn fetch_npm_info(pkgbuild_content: &str) -> Option<NpmPackageInfo> {
             // Fetch closed issues count (best-effort; search API may rate-limit)
             info.github_closed_issues =
                 fetch_github_closed_issues(&owner, clean_repo).unwrap_or(0);
+
+            // Repo spoofing check: does the GitHub repo's root package.json
+            // `name` field plausibly correspond to the npm package name?
+            // Monorepos (e.g. electron-builder → @electron-builder/monorepo)
+            // are common and should not be flagged.
+            if let Some(gh_pkg_name) =
+                fetch_github_package_json_name(&owner, clean_repo)
+            {
+                if !npm_name_matches_repo_name(&package_name, &gh_pkg_name) {
+                    info.repo_spoofed = true;
+                }
+            } else {
+                // No package.json at all in the repo root → can't verify
+                info.repo_spoofed = true;
+            }
         }
     }
 
@@ -399,6 +415,185 @@ fn fetch_github_readme_size(owner: &str, repo: &str) -> Option<u32> {
 }
 
 // ──────────────────────────────────────────────────────────
+// GitHub API: package.json name (for repo spoofing detection)
+// ──────────────────────────────────────────────────────────
+
+/// Fetch the repo's root `package.json` from GitHub and extract its `name`
+/// field. Returns `None` if the repo has no `package.json` at all.
+///
+/// Uses `GET /repos/owner/repo/contents/package.json` and Base64-decodes
+/// the content.
+fn fetch_github_package_json_name(owner: &str, repo: &str) -> Option<String> {
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/contents/package.json"
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let mut request = client
+        .get(&url)
+        .header("User-Agent", "traur")
+        .header("Accept", "application/vnd.github.v3+json");
+
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        if !token.is_empty() {
+            request = request.header("Authorization", format!("Bearer {token}"));
+        }
+    }
+
+    let resp = request
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    #[derive(Deserialize)]
+    struct ContentResponse {
+        content: String,
+    }
+
+    let content_resp: ContentResponse = resp.json().ok()?;
+
+    // Decode Base64 (GitHub Content API returns base64-encoded)
+    let decoded = base64_decode(&content_resp.content)?;
+
+    // Parse just the "name" field from JSON
+    extract_json_name_field(&decoded)
+}
+
+/// Minimal JSON `"name"` extraction — avoids pulling in a full JSON parser
+/// for a single field lookup.
+fn extract_json_name_field(json_bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(json_bytes).ok()?;
+    // Match `"name"` followed by `:` and a quoted string
+    let re = regex::Regex::new(r#""name"\s*:\s*"([^"]+)""#).unwrap();
+    re.captures(text)
+        .map(|caps| caps[1].to_string())
+}
+
+/// Check whether an npm package name plausibly matches the `name` field
+/// from a GitHub repo's root `package.json`.
+///
+/// This is intentionally loose to avoid false-flagging monorepos, scoped
+/// packages, and renamed repos.  Rules (short-circuit on first match):
+///
+/// 1. Exact case-insensitive match.  Ex: `minimist` = `minimist`
+///
+/// 2. If npm name is unscoped and repo name is scoped (`@x/y`), check if
+///    the scope part equals the npm name.
+///    Ex: `electron-builder` matches `@electron-builder/monorepo`
+///
+/// 3. Substring fallback (after stripping scope prefixes).
+///
+/// 4. Same word-bag: all hyphen-delimited words of the npm name appear in
+///    the repo name.
+fn npm_name_matches_repo_name(npm_name: &str, repo_name: &str) -> bool {
+    let n = npm_name.to_lowercase();
+    let r = repo_name.to_lowercase();
+
+    if n == r {
+        return true;
+    }
+
+    // Helper: split on hyphens, dots, slashes
+    fn words(s: &str) -> Vec<String> {
+        s.split(&['-', '.', '/'])
+            .map(|w| w.to_string())
+            .filter(|w| !w.is_empty())
+            .collect()
+    }
+
+    // npm unscoped, repo scoped: check scope part and unscope remainder
+    if !n.starts_with('@') && r.starts_with('@') {
+        if let Some(slash) = r.find('/') {
+            let scope = &r[1..slash];
+            if n == scope {
+                return true;
+            }
+            let rest = &r[slash + 1..];
+            if n.len() >= 5 && rest.contains(&n) {
+                return true;
+            }
+            let nw = words(&n);
+            let rw = words(rest);
+            if !nw.is_empty() && nw.iter().all(|w| rw.contains(w)) {
+                return true;
+            }
+        }
+    }
+
+    // Both scoped: compare unscope parts
+    if n.starts_with('@') && r.starts_with('@') {
+        if let (Some(nu), Some(ru)) = (n.split('/').nth(1), r.split('/').nth(1)) {
+            if nu == ru {
+                return true;
+            }
+            if nu.len() > 3 && (ru.contains(nu) || nu.contains(ru)) {
+                return true;
+            }
+        }
+    }
+
+    // Substring fallback
+    if (n.len() >= 5 && r.contains(&n)) || (r.len() >= 5 && n.contains(&r)) {
+        return true;
+    }
+
+    // Word-bag match
+    let nw = words(&n);
+    let rw = words(&r);
+    if !nw.is_empty() && nw.iter().all(|w| rw.contains(w)) {
+        return true;
+    }
+
+    false
+}
+
+/// Decode a Base64 string (GitHub Content API format, may contain newlines).
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    // Minimal Base64 decoder — no external dependency needed.
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let cleaned: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = cleaned.as_bytes();
+    if bytes.is_empty() {
+        return Some(vec![]);
+    }
+    // Build a reverse lookup map
+    let mut lookup = [255u8; 128];
+    for (i, &c) in CHARS.iter().enumerate() {
+        lookup[c as usize] = i as u8;
+    }
+    lookup[b'=' as usize] = 0; // padding is treated as 0
+
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let a = *lookup.get(chunk.first().copied().unwrap_or(0) as usize).unwrap_or(&255);
+        let b = *lookup.get(chunk.get(1).copied().unwrap_or(0) as usize).unwrap_or(&255);
+        let c = *lookup.get(chunk.get(2).copied().unwrap_or(0) as usize).unwrap_or(&255);
+        let d = *lookup.get(chunk.get(3).copied().unwrap_or(0) as usize).unwrap_or(&255);
+        if a == 255 || b == 255 {
+            return None;
+        }
+        out.push((a << 2) | (b >> 4));
+        if chunk.get(2).map_or(false, |&ch| ch != b'=') {
+            if c == 255 {
+                return None;
+            }
+            out.push((b << 4) | (c >> 2));
+            if chunk.get(3).map_or(false, |&ch| ch != b'=') {
+                if d == 255 {
+                    return None;
+                }
+                out.push((c << 6) | d);
+            }
+        }
+    }
+    Some(out)
+}
+
+// ──────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────
 
@@ -499,6 +694,24 @@ mod tests {
         assert_eq!(
             extract_npm_package_name(content).as_deref(),
             Some("malicious-pkg")
+        );
+    }
+
+    #[test]
+    fn extracts_from_bun_install() {
+        let content = "bun add typescript@5.3";
+        assert_eq!(
+            extract_npm_package_name(content).as_deref(),
+            Some("typescript")
+        );
+    }
+
+    #[test]
+    fn extracts_from_bun_install_global() {
+        let content = "bun install -g turbo";
+        assert_eq!(
+            extract_npm_package_name(content).as_deref(),
+            Some("turbo")
         );
     }
 
@@ -700,6 +913,116 @@ package() {
         );
     }
 
+    /// Repo spoofing: npm package claims a GitHub repo but the repo's
+    /// package.json `name` doesn't match → Ω = Rmax = 30.
+    #[test]
+    fn npm_suspicion_repo_spoofed_maxes_out() {
+        let info = test_npm_info_builder()
+            .account_age(365)
+            .package_count(20)
+            .stars(5000)
+            .forks(200)
+            .closed_issues(500)
+            .readme_bytes(5000)
+            .spoofed()
+            .build();
+        let risk = crate::shared::scoring::npm_suspicion_risk(&info);
+        // Everything else looks pristine, but repo_spoofed → Ω=30 → S_npm=30
+        assert_eq!(
+            risk, 30,
+            "Repo spoofing should max out risk at 30 regardless of other signals, got {risk}"
+        );
+    }
+
+    // --- base64_decode tests ---
+
+    #[test]
+    fn base64_decode_hello_world() {
+        let result = base64_decode("SGVsbG8gV29ybGQ=");
+        assert_eq!(result.as_deref(), Some(b"Hello World".as_slice()));
+    }
+
+    #[test]
+    fn base64_decode_with_whitespace() {
+        let result = base64_decode("SGVs bG8g\nV29y bGQ=");
+        assert_eq!(result.as_deref(), Some(b"Hello World".as_slice()));
+    }
+
+    #[test]
+    fn base64_decode_package_json_name() {
+        // Simulates: {"name": "electron-builder", "version": "1.0.0"}
+        let encoded = "eyJuYW1lIjogImVsZWN0cm9uLWJ1aWxkZXIiLCAidmVyc2lvbiI6ICIxLjAuMCJ9";
+        let decoded = base64_decode(encoded).unwrap();
+        let name = extract_json_name_field(&decoded);
+        assert_eq!(name.as_deref(), Some("electron-builder"));
+    }
+
+    #[test]
+    fn extract_json_name_field_basic() {
+        let json = br#"{"name": "minimist", "version": "1.0.0"}"#;
+        assert_eq!(
+            extract_json_name_field(json).as_deref(),
+            Some("minimist")
+        );
+    }
+
+    #[test]
+    fn extract_json_name_field_scoped() {
+        let json = br#"{"name": "@scope/pkg", "version": "1.0.0"}"#;
+        assert_eq!(
+            extract_json_name_field(json).as_deref(),
+            Some("@scope/pkg")
+        );
+    }
+
+    // --- npm_name_matches_repo_name tests ---
+
+    #[test]
+    fn name_match_exact() {
+        assert!(npm_name_matches_repo_name("minimist", "minimist"));
+        assert!(npm_name_matches_repo_name("Electron-Builder", "electron-builder"));
+    }
+
+    #[test]
+    fn name_match_monorepo_scope_equals_npm_name() {
+        // electron-builder → @electron-builder/monorepo
+        assert!(
+            npm_name_matches_repo_name("electron-builder", "@electron-builder/monorepo"),
+            "Scope part equals npm name"
+        );
+    }
+
+    #[test]
+    fn name_match_unscoped_in_scoped_rest() {
+        // npm "core-js" in "@core-js/monorepo" — scope equals npm name
+        assert!(
+            npm_name_matches_repo_name("core-js", "@core-js/monorepo"),
+            "npm name equals scope part of scoped repo name"
+        );
+        // npm "babel" in "@babel/monorepo" — npm name equals scope
+        assert!(
+            npm_name_matches_repo_name("babel", "@babel/monorepo"),
+            "unhyphenated npm name equals scope"
+        );
+    }
+
+    #[test]
+    fn name_match_both_scoped() {
+        assert!(npm_name_matches_repo_name("@scope/pkg", "@scope/pkg"));
+    }
+
+    #[test]
+    fn name_match_substring() {
+        assert!(npm_name_matches_repo_name("foo-lgpl", "foo-lgpl-core"));
+    }
+
+    #[test]
+    fn name_mismatch_completely_different() {
+        assert!(!npm_name_matches_repo_name("electron-builder", "express"));
+        assert!(!npm_name_matches_repo_name("minimist", "lodash"));
+        assert!(!npm_name_matches_repo_name("react", "@vue/core"));
+    }
+
     // --- integration tests (network) ---
 
     /// Integration test: fetch real `atomic-lockfile` from npm registry.
@@ -822,6 +1145,11 @@ package() {
             self.info.github_commit_freshness = days;
             self
         }
+
+        fn spoofed(mut self) -> Self {
+            self.info.repo_spoofed = true;
+            self
+        }
     }
 
     fn test_npm_info_builder() -> TestNpmInfo {
@@ -837,6 +1165,7 @@ package() {
                 github_forks: 10,
                 github_closed_issues: 20,
                 github_readme_bytes: 500,
+                repo_spoofed: false,
             },
         }
     }

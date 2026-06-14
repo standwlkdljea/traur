@@ -56,6 +56,12 @@ pub struct NpmPackageInfo {
     /// README size in bytes from GitHub. Used by f_doc (documentation risk).
     #[serde(default)]
     pub github_readme_bytes: u32,
+    /// True if the GitHub repo's root package.json `name` field does NOT match
+    /// the npm package name, or the repo has no package.json at all. This is a
+    /// critical spoofing signal — the npm metadata claims a repository that
+    /// belongs to a different package.
+    #[serde(default)]
+    pub repo_spoofed: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

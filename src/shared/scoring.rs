@@ -322,7 +322,7 @@ pub(crate) fn npm_suspicion_risk(info: &NpmPackageInfo) -> u32 {
         .iter()
         .any(|cmd| lower.contains(cmd));
 
-    let omega: f64 = if has_critical_payload {
+    let omega: f64 = if has_critical_payload || info.repo_spoofed {
         R_MAX as f64
     } else {
         0.0
@@ -790,6 +790,7 @@ mod tests {
             github_forks: 0,
             github_closed_issues: 0,
             github_readme_bytes: 0,
+            repo_spoofed: false,
         };
         let risk = npm_suspicion_risk(&info);
         // Omega=30 (critical payload) → Snpm = min(30, Σ W·f + 30) = 30
@@ -813,6 +814,7 @@ mod tests {
             github_forks: 20,
             github_closed_issues: 50,
             github_readme_bytes: 2000,
+            repo_spoofed: false,
         };
         let risk = npm_suspicion_risk(&info);
         // Ω=0 (node-gyp is not a critical payload), f_bot≈0.004, f_doc≈0, f_time=0, f_auth≈0.0002
